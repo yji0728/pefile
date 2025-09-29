@@ -1,5 +1,4 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """pefile, Portable Executable reader module
 
 All the PE file basic structures are available with their default names as
@@ -13,103 +12,80 @@ PEs as well as malware, which often attempts to abuse the format way beyond its
 standard use. To the best of my knowledge most of the abuse is handled
 gracefully.
 
-Copyright (c) 2005-2020 Ero Carrera <ero.carrera@gmail.com>
+Copyright (c) 2005-2024 Ero Carrera <ero.carrera@gmail.com>
 """
 
-from __future__ import division
-from __future__ import print_function
-from builtins import bytes
-from builtins import chr
-from builtins import object
-from builtins import range
-from builtins import str
+from __future__ import annotations
 
-__author__ = 'Ero Carrera'
-__version__ = '2020.4.13'
-__contact__ = 'ero.carrera@gmail.com'
+__author__ = "Ero Carrera"
+__version__ = "2024.1.0"
+__contact__ = "ero.carrera@gmail.com"
 
+import codecs
 import collections
+import copy as copymod
+import functools
+import math
+import mmap
 import os
+import string
 import struct
 import sys
-import codecs
 import time
-import math
-import string
-import mmap
+from collections import Counter
+from functools import lru_cache
+from hashlib import md5, sha1, sha256, sha512
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import ordlookup
 
-from collections import Counter
-from hashlib import sha1
-from hashlib import sha256
-from hashlib import sha512
-from hashlib import md5
-
-import functools
-import copy as copymod
+# Python 3.8+ compatibility
+long = int
 
 
-PY3 = sys.version_info > (3,)
-
-if PY3:
-    long = int
-    # lru_cache with a shallow copy of the objects returned (list, dicts, ..)
-    # we don't use deepcopy as it's _really_ slow and the data we retrieved using this is enough with copy.copy
-    # taken from https://stackoverflow.com/questions/54909357/how-to-get-functools-lru-cache-to-return-new-instances
-    def lru_cache(maxsize=128, typed=False, copy=False):
-        if not copy:
-            return functools.lru_cache(maxsize, typed)
-
-        def decorator(f):
-            cached_func = functools.lru_cache(maxsize, typed)(f)
-            @functools.wraps(f)
-            def wrapper(*args, **kwargs):
-                # return copymod.deepcopy(cached_func(*args, **kwargs))
-                return copymod.copy(cached_func(*args, **kwargs))
-            return wrapper
-        return decorator
-else:
-    # lru_cache that does nothing on python2
-    def lru_cache(maxsize=128, typed=False, copy=False):
-        def decorator(f):
-            @functools.wraps(f)
-            def wrapper(*args, **kwargs):
-                return f(*args, **kwargs)
-            return wrapper
-        return decorator
+def lru_cache_with_copy(maxsize: int = 128, typed: bool = False) -> Any:
+    """LRU cache with shallow copy of returned objects."""
+    
+    def decorator(f):
+        cached_func = lru_cache(maxsize=maxsize, typed=typed)(f)
+        
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            result = cached_func(*args, **kwargs)
+            # Return shallow copy for mutable objects
+            if isinstance(result, (list, dict, set)):
+                return copymod.copy(result)
+            return result
+        return wrapper
+    return decorator
 
 
 @lru_cache(maxsize=2048)
-def cache_adjust_FileAlignment(val, file_alignment):
+def cache_adjust_FileAlignment(val: int, file_alignment: int) -> int:
+    """Adjust file alignment value according to PE specification."""
     if file_alignment < FILE_ALIGNMENT_HARDCODED_VALUE:
         return val
     return (int(val / 0x200)) * 0x200
 
 
 @lru_cache(maxsize=2048)
-def cache_adjust_SectionAlignment(val, section_alignment, file_alignment):
-    if section_alignment < 0x1000: # page size
+def cache_adjust_SectionAlignment(val: int, section_alignment: int, file_alignment: int) -> int:
+    """Adjust section alignment value according to PE specification."""
+    if section_alignment < 0x1000:  # page size
         section_alignment = file_alignment
 
     # 0x200 is the minimum valid FileAlignment according to the documentation
     # although ntoskrnl.exe has an alignment of 0x80 in some Windows versions
-    #
-    #elif section_alignment < 0x80:
-    #    section_alignment = 0x80
 
     if section_alignment and val % section_alignment:
-        return section_alignment * ( int(val / section_alignment) )
+        return section_alignment * (int(val / section_alignment))
     return val
 
 
-def count_zeroes(data):
-    try:
-        # newbytes' count() takes a str in Python 2
-        count = data.count('\0')
-    except TypeError:
-        # bytes' count() takes an int in Python 3
-        count = data.count(0)
-    return count
+def count_zeroes(data: bytes) -> int:
+    """Count zero bytes in data."""
+    return data.count(0)
 
 fast_load = False
 
@@ -684,30 +660,16 @@ def power_of_two(val):
     return val != 0 and (val & (val-1)) == 0
 
 
-# These come from the great article[1] which contains great insights on
-# working with unicode in both Python 2 and 3.
-# [1]: http://python3porting.com/problems.html
-if not PY3:
-    def handler(err):
-        start = err.start
-        end = err.end
-        values = [
-            ('\\u{0:04x}' if ord(err.object[i]) > 255 else '\\x{0:02x}',
-             ord(err.object[i])) for i in range(start,end)]
-        return (
-            u"".join([elm[0].format(elm[1]) for elm in values]),
-            end)
-    import codecs
-    codecs.register_error('backslashreplace_', handler)
-    def b(x):
-        return x
-else:
-    import codecs
-    codecs.register_error('backslashreplace_', codecs.lookup_error('backslashreplace'))
-    def b(x):
-        if isinstance(x, (bytes, bytearray)):
-            return bytes(x)
-        return codecs.encode(x, 'cp1252')
+# Modern Python 3.8+ approach - no need for compatibility functions
+import codecs
+codecs.register_error('backslashreplace_', codecs.lookup_error('backslashreplace'))
+
+
+def b(x: Union[str, bytes]) -> bytes:
+    """Convert string to bytes using cp1252 encoding."""
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    return codecs.encode(x, 'cp1252')
 
 
 class UnicodeStringWrapperPostProcessor(object):
@@ -786,11 +748,27 @@ class UnicodeStringWrapperPostProcessor(object):
 class PEFormatError(Exception):
     """Generic PE format error exception."""
 
-    def __init__(self, value):
+    def __init__(self, value: str) -> None:
         self.value = value
+        super().__init__(value)
 
-    def __str__(self):
-        return repr(self.value)
+    def __str__(self) -> str:
+        return self.value
+
+
+class PESecurityError(PEFormatError):
+    """PE security validation error."""
+    pass
+
+
+class PEImportError(PEFormatError):
+    """PE import table parsing error."""
+    pass
+
+
+class PEResourceError(PEFormatError):
+    """PE resource parsing error."""
+    pass
 
 
 class Dump(object):
@@ -841,26 +819,28 @@ STRUCT_SIZEOF_TYPES = {
     's': 1 }
 
 @lru_cache(maxsize=2048)
-def sizeof_type(t):
+def sizeof_type(t: str) -> int:
+    """Calculate size of struct format type string."""
     count = 1
     _t = t
     if t[0] in string.digits:
         # extract the count
-        count = int( ''.join([d for d in t if d in string.digits]) )
-        _t = ''.join([d for d in t if d not in string.digits])
+        count = int(''.join(d for d in t if d in string.digits))
+        _t = ''.join(d for d in t if d not in string.digits)
     return STRUCT_SIZEOF_TYPES[_t] * count
 
-@lru_cache(maxsize=2048, copy=True)
-def set_format(format):
 
+@lru_cache_with_copy(maxsize=2048)
+def set_format(format_list: List[str]) -> Dict[str, Any]:
+    """Set format for struct parsing with caching."""
     __format__ = '<'
     __unpacked_data_elms__ = []
-    __field_offsets__ = dict()
+    __field_offsets__ = {}
     __keys__ = []
     __format_length__ = 0
 
     offset = 0
-    for elm in format:
+    for elm in format_list:
         if ',' in elm:
             elm_type, elm_name = elm.split(',', 1)
             __format__ += elm_type
@@ -872,7 +852,7 @@ def set_format(format):
                 if elm_name in __keys__:
                     search_list = [x[:len(elm_name)] for x in __keys__]
                     occ_count = search_list.count(elm_name)
-                    elm_name =  '{0}_{1:d}'.format(elm_name, occ_count)
+                    elm_name = f'{elm_name}_{occ_count:d}'
                 names.append(elm_name)
                 __field_offsets__[elm_name] = offset
 
@@ -885,7 +865,7 @@ def set_format(format):
 
     __format_length__ = struct.calcsize(__format__)
 
-    return ( __format__, __unpacked_data_elms__, __field_offsets__, __keys__, __format_length__)
+    return (__format__, __unpacked_data_elms__, __field_offsets__, __keys__, __format_length__)
 
 
 
@@ -1501,14 +1481,9 @@ class BoundImportRefData(DataContainer):
 # The filename length is not checked because the DLLs filename
 # can be longer that the 8.3
 
-if PY3:
-    allowed_filename = b(
-        string.ascii_lowercase + string.ascii_uppercase +
-        string.digits + "!#$%&'()-@^_`{}~+,.;=[]")
-else: # Python 2.x
-    allowed_filename = b(
-        string.lowercase + string.uppercase + string.digits +
-        b"!#$%&'()-@^_`{}~+,.;=[]")
+allowed_filename = b(
+    string.ascii_lowercase + string.ascii_uppercase +
+    string.digits + "!#$%&'()-@^_`{}~+,.;=[]")
 
 def is_valid_dos_filename(s):
     if s is None or not isinstance(s, (str, bytes, bytearray)):
@@ -1521,24 +1496,22 @@ def is_valid_dos_filename(s):
 # Check if an imported name uses the valid accepted characters expected in mangled
 # function names. If the symbol's characters don't fall within this charset
 # we will assume the name is invalid
-#
-if PY3:
-    allowed_function_name = b(
-        string.ascii_lowercase + string.ascii_uppercase +
-        string.digits + '_?@$()<>')
-else:
-    allowed_function_name = b(
-        string.lowercase + string.uppercase +
-        string.digits + b'_?@$()<>')
+
+allowed_function_name = (
+    string.ascii_lowercase + string.ascii_uppercase +
+    string.digits + '_?@$()<>'
+).encode('ascii')
+
 
 @lru_cache(maxsize=2048)
-def is_valid_function_name(s):
+def is_valid_function_name(s: Optional[Union[str, bytes, bytearray]]) -> bool:
+    """Check if a function name contains only valid characters."""
     return (s is not None and
-        isinstance(s, (str, bytes, bytearray)) and
-        all(c in allowed_function_name for c in set(s)))
+            isinstance(s, (str, bytes, bytearray)) and
+            all(c in allowed_function_name for c in set(s)))
 
 
-class PE(object):
+class PE:
     """A Portable Executable representation.
 
     This class provides access to most of the information in a PE file.
@@ -1550,6 +1523,7 @@ class PE(object):
 
     pe = pefile.PE('module.dll')
     pe = pefile.PE(name='module.dll')
+    pe = pefile.PE(Path('module.dll'))  # pathlib support
 
     would load 'module.dll' and process it. If the data is already
     available in a buffer the same can be achieved with:
@@ -1802,9 +1776,14 @@ class PE(object):
     __IMAGE_BOUND_FORWARDER_REF_format__ = ('IMAGE_BOUND_FORWARDER_REF',
         ('I,TimeDateStamp', 'H,OffsetModuleName', 'H,Reserved') )
 
-    def __init__(self, name=None, data=None, fast_load=None,
-                 max_symbol_exports=MAX_SYMBOL_EXPORT_COUNT,
-                 max_repeated_symbol=120):
+    def __init__(
+        self, 
+        name: Optional[Union[str, Path]] = None, 
+        data: Optional[bytes] = None, 
+        fast_load: Optional[bool] = None,
+        max_symbol_exports: int = MAX_SYMBOL_EXPORT_COUNT,
+        max_repeated_symbol: int = 120
+    ) -> None:
 
         self.max_symbol_exports = max_symbol_exports
         self.max_repeated_symbol = max_repeated_symbol
@@ -1817,6 +1796,10 @@ class PE(object):
 
         if name is None and data is None:
             raise ValueError('Must supply either name or data')
+
+        # Convert pathlib Path to string for backward compatibility
+        if isinstance(name, Path):
+            name = str(name)
 
         # This list will keep track of all the structures created.
         # That will allow for an easy iteration through the list
@@ -5824,23 +5807,48 @@ class PE(object):
 
 
 
-def main():
+def main() -> None:
+    """Command-line interface for pefile."""
+    import argparse
     import sys
+    from pathlib import Path
 
-    usage = """\
-pefile.py <filename>
-pefile.py exports <filename>"""
+    parser = argparse.ArgumentParser(
+        description="Parse and analyze Portable Executable (PE) files",
+        prog="pefile"
+    )
+    parser.add_argument("filename", type=Path, help="PE file to analyze")
+    parser.add_argument(
+        "--exports", action="store_true", 
+        help="Show exports table"
+    )
+    parser.add_argument(
+        "--version", action="version", 
+        version=f"pefile {__version__}"
+    )
 
-    if not sys.argv[1:]:
-        print(usage)
-    elif sys.argv[1] == 'exports':
-        if not sys.argv[2:]:
-            sys.exit('error: <filename> required')
-        pe = PE(sys.argv[2])
-        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-            print(hex(pe.OPTIONAL_HEADER.ImageBase + exp.address), exp.name, exp.ordinal)
-    else:
-        print(PE(sys.argv[1]).dump_info())
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
+    args = parser.parse_args()
+
+    try:
+        pe = PE(args.filename)
+        
+        if args.exports:
+            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    print(f"{hex(pe.OPTIONAL_HEADER.ImageBase + exp.address)} {exp.name} {exp.ordinal}")
+            else:
+                print("No exports found in this PE file")
+        else:
+            print(pe.dump_info())
+            
+    except Exception as e:
+        print(f"Error processing {args.filename}: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
