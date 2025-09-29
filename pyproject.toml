@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pefile"
 version = "2024.1.0"
-description = "Python PE parsing module"
+description = "Modern Python PE parsing module with Python 3.8+ features"
 authors = [
     {name = "Ero Carrera", email = "ero.carrera@gmail.com"}
 ]
@@ -19,7 +19,7 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: MIT License", 
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -30,24 +30,29 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Filesystems",
-    "Topic :: Security"
+    "Topic :: Security",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Disassemblers",
 ]
-keywords = ["pe", "exe", "dll", "pefile", "pecoff", "portable executable", "malware analysis"]
+keywords = ["pe", "exe", "dll", "pefile", "pecoff", "portable executable", "malware analysis", "reverse engineering"]
 dependencies = []
 
 [project.optional-dependencies]
+async = ["aiofiles>=23.0.0"]
 dev = [
     "black>=23.0.0",
-    "isort>=5.12.0",
+    "isort>=5.12.0", 
     "flake8>=6.0.0",
     "mypy>=1.5.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
-    "pre-commit>=3.0.0"
+    "pre-commit>=3.0.0",
+    "aiofiles>=23.0.0"
 ]
 test = [
     "pytest>=7.0.0",
-    "pytest-cov>=4.0.0"
+    "pytest-cov>=4.0.0", 
+    "pytest-asyncio>=0.21.0"
 ]
 
 [project.urls]
@@ -55,6 +60,7 @@ Homepage = "https://github.com/erocarrera/pefile"
 Repository = "https://github.com/erocarrera/pefile"
 "Bug Tracker" = "https://github.com/erocarrera/pefile/issues"
 Documentation = "https://github.com/erocarrera/pefile"
+Changelog = "https://github.com/erocarrera/pefile/releases"
 
 [project.scripts]
 pefile = "pefile:main"
@@ -109,6 +115,7 @@ minversion = "7.0"
 addopts = "-ra -q --strict-markers --cov=pefile --cov=peutils --cov-report=term-missing"
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
+asyncio_mode = "auto"
 
 [tool.coverage.run]
 source = ["pefile", "peutils", "ordlookup"]
@@ -117,7 +124,7 @@ omit = ["*/tests/*", "*/test_*"]
 [tool.coverage.report]
 exclude_lines = [
     "pragma: no cover",
-    "def __repr__",
+    "def __repr__", 
     "if self.debug:",
     "if settings.DEBUG",
     "raise AssertionError",
@@ -127,3 +134,7 @@ exclude_lines = [
     "class .*\\bProtocol\\):",
     "@(abc\\.)?abstractmethod",
 ]
+
+[tool.bandit]
+exclude_dirs = ["tests", "build", "dist"]
+skips = ["B101"]  # Skip assert_used test

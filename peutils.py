@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """peutils, Portable Executable utilities module
 
+This module provides utilities for analyzing PE files, including signature
+database functionality for packer detection and various validation functions.
+
+Example:
+    >>> import peutils
+    >>> sig_db = peutils.SignatureDatabase('signatures.txt')
+    >>> matches = sig_db.match_all(pe, ep_only=False)
+
 Copyright (c) 2005-2024 Ero Carrera <ero.carrera@gmail.com>
 
 All rights reserved.
@@ -21,6 +29,12 @@ import pefile
 __author__ = "Ero Carrera"
 __version__ = pefile.__version__
 __contact__ = "ero.carrera@gmail.com"
+__all__ = [
+    "SignatureDatabase",
+    "is_valid", 
+    "is_suspicious",
+    "is_probably_packed",
+]
 
 
 class SignatureDatabase:
