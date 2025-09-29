@@ -33,6 +33,7 @@ import struct
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from functools import lru_cache
 from hashlib import md5, sha1, sha256, sha512
 from pathlib import Path
@@ -40,8 +41,56 @@ from typing import Any, Dict, List, Optional, Union
 
 import ordlookup
 
+try:
+    import asyncio
+    import aiofiles
+    ASYNC_SUPPORT = True
+except ImportError:
+    ASYNC_SUPPORT = False
+
 # Python 3.8+ compatibility
 long = int
+
+
+@dataclass
+class PEConfig:
+    """Configuration settings for PE parsing."""
+    
+    # File size limits  
+    max_file_size: int = 100 * 1024 * 1024  # 100MB
+    max_string_length: int = 0x100000  # 2^20
+    max_import_symbols: int = 0x2000
+    max_sections: int = 0x800
+    max_resource_entries: int = 0x8000
+    max_resource_depth: int = 32
+    
+    # Length limits for specific string types
+    max_import_name_length: int = 0x200
+    max_dll_length: int = 0x200
+    max_symbol_name_length: int = 0x200
+    
+    # Export limits
+    max_symbol_exports: int = 0x2000
+    max_repeated_addresses: int = 0x100
+    max_address_spread: int = 128 * 1024 * 1024  # 128MB
+    
+    # File alignment constraints
+    file_alignment_hardcoded_value: int = 0x200
+    
+    # Security options
+    enable_security_checks: bool = True
+    strict_parsing: bool = False
+    
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.max_file_size <= 0:
+            raise ValueError("max_file_size must be positive")
+        if self.max_string_length <= 0:
+            raise ValueError("max_string_length must be positive")
+
+
+# Global configuration instance
+DEFAULT_CONFIG = PEConfig()
 
 
 def lru_cache_with_copy(maxsize: int = 128, typed: bool = False) -> Any:
@@ -89,30 +138,16 @@ def count_zeroes(data: bytes) -> int:
 
 fast_load = False
 
-# This will set a maximum length of a string to be retrieved from the file.
-# It's there to prevent loading massive amounts of data from memory mapped
-# files. Strings longer than 1MB should be rather rare.
-MAX_STRING_LENGTH = 0x100000 # 2^20
-
-# Maximum number of imports to parse.
-MAX_IMPORT_SYMBOLS = 0x2000
-
-# Limit maximum length for specific string types separately
-MAX_IMPORT_NAME_LENGTH = 0x200
-MAX_DLL_LENGTH = 0x200
-MAX_SYMBOL_NAME_LENGTH = 0x200
-
-# Lmit maximum number of sections before processing of sections will stop
-MAX_SECTIONS = 0x800
-
-# The global maximum number of resource entries to parse per file
-MAX_RESOURCE_ENTRIES = 0x8000
-
-# The maximum depth of nested resource tables
-MAX_RESOURCE_DEPTH = 32
-
-# Limit number of exported symbols
-MAX_SYMBOL_EXPORT_COUNT = 0x2000
+# Backwards compatibility constants - now using PEConfig
+MAX_STRING_LENGTH = DEFAULT_CONFIG.max_string_length  # 2^20
+MAX_IMPORT_SYMBOLS = DEFAULT_CONFIG.max_import_symbols
+MAX_IMPORT_NAME_LENGTH = DEFAULT_CONFIG.max_import_name_length
+MAX_DLL_LENGTH = DEFAULT_CONFIG.max_dll_length
+MAX_SYMBOL_NAME_LENGTH = DEFAULT_CONFIG.max_symbol_name_length
+MAX_SECTIONS = DEFAULT_CONFIG.max_sections
+MAX_RESOURCE_ENTRIES = DEFAULT_CONFIG.max_resource_entries
+MAX_RESOURCE_DEPTH = DEFAULT_CONFIG.max_resource_depth
+MAX_SYMBOL_EXPORT_COUNT = DEFAULT_CONFIG.max_symbol_exports
 
 IMAGE_DOS_SIGNATURE             = 0x5A4D
 IMAGE_DOSZM_SIGNATURE           = 0x4D5A
@@ -346,7 +381,7 @@ dll_characteristics = [
 
 DLL_CHARACTERISTICS = two_way_dict(dll_characteristics)
 
-FILE_ALIGNMENT_HARDCODED_VALUE = 0x200
+FILE_ALIGNMENT_HARDCODED_VALUE = DEFAULT_CONFIG.file_alignment_hardcoded_value
 
 # Resource types
 resource_type = [
@@ -1827,12 +1862,42 @@ class PE:
             raise
 
 
-    def close(self):
-        if ( self.__from_file is True and hasattr(self, '__data__') and
+    def close(self) -> None:
+        """Close the PE file and cleanup resources."""
+        if (self.__from_file is True and hasattr(self, '__data__') and
             ((isinstance(mmap.mmap, type) and isinstance(self.__data__, mmap.mmap)) or
-           'mmap.mmap' in repr(type(self.__data__))) ):
+             'mmap.mmap' in repr(type(self.__data__)))):
                 self.__data__.close()
                 del self.__data__
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+        return False
+
+    @classmethod
+    async def from_file_async(cls, filepath: Union[str, Path], fast_load: bool = False) -> "PE":
+        """Asynchronously create PE instance from file.
+        
+        Requires aiofiles package for async file operations.
+        """
+        if not ASYNC_SUPPORT:
+            raise ImportError("Async support requires 'aiofiles' package")
+        
+        filepath = Path(filepath)
+        
+        # Security check
+        if filepath.stat().st_size > DEFAULT_CONFIG.max_file_size:
+            raise PESecurityError(f"File too large: {filepath.stat().st_size}")
+        
+        async with aiofiles.open(filepath, 'rb') as f:
+            data = await f.read()
+        
+        return cls(data=data, fast_load=fast_load)
 
 
     def __unpack_data__(self, format, data, file_offset):
@@ -1856,7 +1921,7 @@ class PE:
         return structure
 
 
-    def __parse__(self, fname, data, fast_load):
+    def __parse__(self, fname: Optional[str], data: Optional[bytes], fast_load: bool) -> None:
         """Parse a Portable Executable file.
 
         Loads a PE file, parsing all its structures and making them available
@@ -1864,9 +1929,18 @@ class PE:
         """
 
         if fname is not None:
+            # Security: Validate file path
+            if not isinstance(fname, str) or len(fname) > 4096:
+                raise PESecurityError("Invalid file path")
+            
             stat = os.stat(fname)
             if stat.st_size == 0:
                 raise PEFormatError('The file is empty')
+            
+            # Security: Check file size limit
+            if stat.st_size > DEFAULT_CONFIG.max_file_size:
+                raise PESecurityError(f"File too large: {stat.st_size} bytes (max: {DEFAULT_CONFIG.max_file_size})")
+            
             fd = None
             try:
                 fd = open(fname, 'rb')
@@ -1879,13 +1953,20 @@ class PE:
                     self.__data__ = mmap.mmap(self.fileno, 0, access=mmap.ACCESS_READ)
                 self.__from_file = True
             except IOError as excp:
-                exception_msg = '{0}'.format(excp)
-                exception_msg = exception_msg and (': %s' % exception_msg)
-                raise Exception('Unable to access file \'{0}\'{1}'.format(fname, exception_msg))
+                exception_msg = f'{excp}'
+                exception_msg = exception_msg and (f': {exception_msg}')
+                raise Exception(f'Unable to access file \'{fname}\'{exception_msg}')
             finally:
                 if fd is not None:
                     fd.close()
         elif data is not None:
+            # Security: Validate data input
+            if not isinstance(data, (bytes, bytearray)):
+                raise PESecurityError("Data must be bytes or bytearray")
+            
+            if len(data) > DEFAULT_CONFIG.max_file_size:
+                raise PESecurityError(f"Data too large: {len(data)} bytes (max: {DEFAULT_CONFIG.max_file_size})")
+            
             self.__data__ = data
             self.__from_file = False
 
