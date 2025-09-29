@@ -1,37 +1,49 @@
-# -*- coding: Latin-1 -*-
+#!/usr/bin/env python3
 """peutils, Portable Executable utilities module
 
+This module provides utilities for analyzing PE files, including signature
+database functionality for packer detection and various validation functions.
 
-Copyright (c) 2005-2020 Ero Carrera <ero.carrera@gmail.com>
+Example:
+    >>> import peutils
+    >>> sig_db = peutils.SignatureDatabase('signatures.txt')
+    >>> matches = sig_db.match_all(pe, ep_only=False)
+
+Copyright (c) 2005-2024 Ero Carrera <ero.carrera@gmail.com>
 
 All rights reserved.
 """
-from __future__ import division
-from future import standard_library
-standard_library.install_aliases()
-from builtins import range
-from builtins import object
+
+from __future__ import annotations
 
 import os
 import re
 import string
-import urllib.request, urllib.parse, urllib.error
+import urllib.request
+import urllib.parse
+import urllib.error
+from typing import Dict, List, Optional, Union, Any
+
 import pefile
 
-__author__ = 'Ero Carrera'
+__author__ = "Ero Carrera"
 __version__ = pefile.__version__
-__contact__ = 'ero.carrera@gmail.com'
+__contact__ = "ero.carrera@gmail.com"
+__all__ = [
+    "SignatureDatabase",
+    "is_valid", 
+    "is_suspicious",
+    "is_probably_packed",
+]
 
 
-class SignatureDatabase(object):
+class SignatureDatabase:
     """This class loads and keeps a parsed PEiD signature database.
 
     Usage:
-
         sig_db = SignatureDatabase('/path/to/signature/file')
 
-    and/or
-
+    and/or:
         sig_db = SignatureDatabase()
         sig_db.load('/path/to/signature/file')
 
@@ -41,12 +53,11 @@ class SignatureDatabase(object):
     signature database will be downloaded from that location.
     """
 
-    def __init__(self, filename=None, data=None):
+    def __init__(self, filename: Optional[str] = None, data: Optional[bytes] = None) -> None:
 
         # RegExp to match a signature block
-        #
         self.parse_sig = re.compile(
-            '\[(.*?)\]\s+?signature\s*=\s*(.*?)(\s+\?\?)*\s*ep_only\s*=\s*(\w+)(?:\s*section_start_only\s*=\s*(\w+)|)', re.S)
+            r'\[(.*?)\]\s+?signature\s*=\s*(.*?)(\s+\?\?)*\s*ep_only\s*=\s*(\w+)(?:\s*section_start_only\s*=\s*(\w+)|)', re.S)
 
         # Signature information
         #

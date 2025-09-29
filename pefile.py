@@ -1,5 +1,4 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """pefile, Portable Executable reader module
 
 All the PE file basic structures are available with their default names as
@@ -13,130 +12,194 @@ PEs as well as malware, which often attempts to abuse the format way beyond its
 standard use. To the best of my knowledge most of the abuse is handled
 gracefully.
 
-Copyright (c) 2005-2020 Ero Carrera <ero.carrera@gmail.com>
+Copyright (c) 2005-2024 Ero Carrera <ero.carrera@gmail.com>
+
+Example:
+    >>> import pefile
+    >>> with pefile.PE("malware.exe") as pe:
+    ...     print(f"Entry point: {hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint)}")
+    ...     print(f"Sections: {len(pe.sections)}")
+    
+    >>> # Async usage
+    >>> pe = await pefile.PE.from_file_async("large_file.exe")
 """
 
-from __future__ import division
-from __future__ import print_function
-from builtins import bytes
-from builtins import chr
-from builtins import object
-from builtins import range
-from builtins import str
+from __future__ import annotations
 
-__author__ = 'Ero Carrera'
-__version__ = '2020.4.13'
-__contact__ = 'ero.carrera@gmail.com'
+__author__ = "Ero Carrera"
+__version__ = "2024.1.0"
+__contact__ = "ero.carrera@gmail.com"
+__all__ = [
+    # Main classes
+    "PE",
+    "PEConfig", 
+    "Structure",
+    "Dump",
+    
+    # Exceptions
+    "PEFormatError",
+    "PESecurityError", 
+    "PEImportError",
+    "PEResourceError",
+    
+    # Configuration
+    "DEFAULT_CONFIG",
+    
+    # Constants (backward compatibility)
+    "MAX_STRING_LENGTH",
+    "MAX_IMPORT_SYMBOLS",
+    "MAX_SECTIONS",
+    "MAX_RESOURCE_ENTRIES",
+    "MAX_RESOURCE_DEPTH",
+    "FILE_ALIGNMENT_HARDCODED_VALUE",
+    
+    # Utilities
+    "is_valid_function_name",
+    "sizeof_type",
+]
 
+import codecs
 import collections
+import copy as copymod
+import functools
+import math
+import mmap
 import os
+import string
 import struct
 import sys
-import codecs
 import time
-import math
-import string
-import mmap
+from collections import Counter
+from dataclasses import dataclass, field
+from functools import lru_cache
+from hashlib import md5, sha1, sha256, sha512
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
 import ordlookup
 
-from collections import Counter
-from hashlib import sha1
-from hashlib import sha256
-from hashlib import sha512
-from hashlib import md5
+try:
+    import asyncio
+    import aiofiles
+    ASYNC_SUPPORT = True
+except ImportError:
+    ASYNC_SUPPORT = False
 
-import functools
-import copy as copymod
+# Python 3.8+ compatibility
+long = int
 
 
-PY3 = sys.version_info > (3,)
+@dataclass
+class PEConfig:
+    """Configuration settings for PE parsing."""
+    
+    # File size limits  
+    max_file_size: int = 100 * 1024 * 1024  # 100MB
+    max_string_length: int = 0x100000  # 2^20
+    max_import_symbols: int = 0x2000
+    max_sections: int = 0x800
+    max_resource_entries: int = 0x8000
+    max_resource_depth: int = 32
+    
+    # Length limits for specific string types
+    max_import_name_length: int = 0x200
+    max_dll_length: int = 0x200
+    max_symbol_name_length: int = 0x200
+    
+    # Export limits
+    max_symbol_exports: int = 0x2000
+    max_repeated_addresses: int = 0x100
+    max_address_spread: int = 128 * 1024 * 1024  # 128MB
+    
+    # File alignment constraints
+    file_alignment_hardcoded_value: int = 0x200
+    
+    # Security options
+    enable_security_checks: bool = True
+    strict_parsing: bool = False
+    
+    def __post_init__(self):
+        """Validate configuration values."""
+        if self.max_file_size <= 0:
+            raise ValueError("max_file_size must be positive")
+        if self.max_string_length <= 0:
+            raise ValueError("max_string_length must be positive")
 
-if PY3:
-    long = int
-    # lru_cache with a shallow copy of the objects returned (list, dicts, ..)
-    # we don't use deepcopy as it's _really_ slow and the data we retrieved using this is enough with copy.copy
-    # taken from https://stackoverflow.com/questions/54909357/how-to-get-functools-lru-cache-to-return-new-instances
-    def lru_cache(maxsize=128, typed=False, copy=False):
-        if not copy:
-            return functools.lru_cache(maxsize, typed)
 
-        def decorator(f):
-            cached_func = functools.lru_cache(maxsize, typed)(f)
-            @functools.wraps(f)
-            def wrapper(*args, **kwargs):
-                # return copymod.deepcopy(cached_func(*args, **kwargs))
-                return copymod.copy(cached_func(*args, **kwargs))
-            return wrapper
-        return decorator
-else:
-    # lru_cache that does nothing on python2
-    def lru_cache(maxsize=128, typed=False, copy=False):
-        def decorator(f):
-            @functools.wraps(f)
-            def wrapper(*args, **kwargs):
-                return f(*args, **kwargs)
-            return wrapper
-        return decorator
+# Global configuration instance
+DEFAULT_CONFIG = PEConfig()
+
+
+def lru_cache_with_copy(maxsize: int = 128, typed: bool = False) -> Any:
+    """LRU cache with shallow copy of returned objects."""
+    
+    def decorator(f):
+        cached_func = lru_cache(maxsize=maxsize, typed=typed)(f)
+        
+        @functools.wraps(f)
+        def wrapper(*args, **kwargs):
+            result = cached_func(*args, **kwargs)
+            # Return shallow copy for mutable objects
+            if isinstance(result, (list, dict, set)):
+                return copymod.copy(result)
+            return result
+        return wrapper
+    return decorator
 
 
 @lru_cache(maxsize=2048)
-def cache_adjust_FileAlignment(val, file_alignment):
+def cache_adjust_FileAlignment(val: int, file_alignment: int, /) -> int:
+    """Adjust file alignment value according to PE specification.
+    
+    Args:
+        val: Value to adjust (positional-only)
+        file_alignment: File alignment value (positional-only)
+    """
     if file_alignment < FILE_ALIGNMENT_HARDCODED_VALUE:
         return val
     return (int(val / 0x200)) * 0x200
 
 
 @lru_cache(maxsize=2048)
-def cache_adjust_SectionAlignment(val, section_alignment, file_alignment):
-    if section_alignment < 0x1000: # page size
+def cache_adjust_SectionAlignment(val: int, section_alignment: int, file_alignment: int, /) -> int:
+    """Adjust section alignment value according to PE specification.
+    
+    Args:
+        val: Value to adjust (positional-only)
+        section_alignment: Section alignment value (positional-only)
+        file_alignment: File alignment value (positional-only)
+    """
+    if section_alignment < 0x1000:  # page size
         section_alignment = file_alignment
 
     # 0x200 is the minimum valid FileAlignment according to the documentation
     # although ntoskrnl.exe has an alignment of 0x80 in some Windows versions
-    #
-    #elif section_alignment < 0x80:
-    #    section_alignment = 0x80
 
     if section_alignment and val % section_alignment:
-        return section_alignment * ( int(val / section_alignment) )
+        return section_alignment * (int(val / section_alignment))
     return val
 
 
-def count_zeroes(data):
-    try:
-        # newbytes' count() takes a str in Python 2
-        count = data.count('\0')
-    except TypeError:
-        # bytes' count() takes an int in Python 3
-        count = data.count(0)
-    return count
+def count_zeroes(data: bytes, /) -> int:
+    """Count zero bytes in data.
+    
+    Args:
+        data: Byte data to count zeros in (positional-only)
+    """
+    return data.count(0)
 
 fast_load = False
 
-# This will set a maximum length of a string to be retrieved from the file.
-# It's there to prevent loading massive amounts of data from memory mapped
-# files. Strings longer than 1MB should be rather rare.
-MAX_STRING_LENGTH = 0x100000 # 2^20
-
-# Maximum number of imports to parse.
-MAX_IMPORT_SYMBOLS = 0x2000
-
-# Limit maximum length for specific string types separately
-MAX_IMPORT_NAME_LENGTH = 0x200
-MAX_DLL_LENGTH = 0x200
-MAX_SYMBOL_NAME_LENGTH = 0x200
-
-# Lmit maximum number of sections before processing of sections will stop
-MAX_SECTIONS = 0x800
-
-# The global maximum number of resource entries to parse per file
-MAX_RESOURCE_ENTRIES = 0x8000
-
-# The maximum depth of nested resource tables
-MAX_RESOURCE_DEPTH = 32
-
-# Limit number of exported symbols
-MAX_SYMBOL_EXPORT_COUNT = 0x2000
+# Backwards compatibility constants - now using PEConfig
+MAX_STRING_LENGTH = DEFAULT_CONFIG.max_string_length  # 2^20
+MAX_IMPORT_SYMBOLS = DEFAULT_CONFIG.max_import_symbols
+MAX_IMPORT_NAME_LENGTH = DEFAULT_CONFIG.max_import_name_length
+MAX_DLL_LENGTH = DEFAULT_CONFIG.max_dll_length
+MAX_SYMBOL_NAME_LENGTH = DEFAULT_CONFIG.max_symbol_name_length
+MAX_SECTIONS = DEFAULT_CONFIG.max_sections
+MAX_RESOURCE_ENTRIES = DEFAULT_CONFIG.max_resource_entries
+MAX_RESOURCE_DEPTH = DEFAULT_CONFIG.max_resource_depth
+MAX_SYMBOL_EXPORT_COUNT = DEFAULT_CONFIG.max_symbol_exports
 
 IMAGE_DOS_SIGNATURE             = 0x5A4D
 IMAGE_DOSZM_SIGNATURE           = 0x4D5A
@@ -370,7 +433,7 @@ dll_characteristics = [
 
 DLL_CHARACTERISTICS = two_way_dict(dll_characteristics)
 
-FILE_ALIGNMENT_HARDCODED_VALUE = 0x200
+FILE_ALIGNMENT_HARDCODED_VALUE = DEFAULT_CONFIG.file_alignment_hardcoded_value
 
 # Resource types
 resource_type = [
@@ -684,30 +747,16 @@ def power_of_two(val):
     return val != 0 and (val & (val-1)) == 0
 
 
-# These come from the great article[1] which contains great insights on
-# working with unicode in both Python 2 and 3.
-# [1]: http://python3porting.com/problems.html
-if not PY3:
-    def handler(err):
-        start = err.start
-        end = err.end
-        values = [
-            ('\\u{0:04x}' if ord(err.object[i]) > 255 else '\\x{0:02x}',
-             ord(err.object[i])) for i in range(start,end)]
-        return (
-            u"".join([elm[0].format(elm[1]) for elm in values]),
-            end)
-    import codecs
-    codecs.register_error('backslashreplace_', handler)
-    def b(x):
-        return x
-else:
-    import codecs
-    codecs.register_error('backslashreplace_', codecs.lookup_error('backslashreplace'))
-    def b(x):
-        if isinstance(x, (bytes, bytearray)):
-            return bytes(x)
-        return codecs.encode(x, 'cp1252')
+# Modern Python 3.8+ approach - no need for compatibility functions
+import codecs
+codecs.register_error('backslashreplace_', codecs.lookup_error('backslashreplace'))
+
+
+def b(x: Union[str, bytes]) -> bytes:
+    """Convert string to bytes using cp1252 encoding."""
+    if isinstance(x, (bytes, bytearray)):
+        return bytes(x)
+    return codecs.encode(x, 'cp1252')
 
 
 class UnicodeStringWrapperPostProcessor(object):
@@ -786,11 +835,27 @@ class UnicodeStringWrapperPostProcessor(object):
 class PEFormatError(Exception):
     """Generic PE format error exception."""
 
-    def __init__(self, value):
+    def __init__(self, value: str) -> None:
         self.value = value
+        super().__init__(value)
 
-    def __str__(self):
-        return repr(self.value)
+    def __str__(self) -> str:
+        return self.value
+
+
+class PESecurityError(PEFormatError):
+    """PE security validation error."""
+    pass
+
+
+class PEImportError(PEFormatError):
+    """PE import table parsing error."""
+    pass
+
+
+class PEResourceError(PEFormatError):
+    """PE resource parsing error."""
+    pass
 
 
 class Dump(object):
@@ -841,26 +906,32 @@ STRUCT_SIZEOF_TYPES = {
     's': 1 }
 
 @lru_cache(maxsize=2048)
-def sizeof_type(t):
+def sizeof_type(t: str, /) -> int:
+    """Calculate size of struct format type string.
+    
+    Args:
+        t: Format type string (positional-only)
+    """
     count = 1
     _t = t
     if t[0] in string.digits:
         # extract the count
-        count = int( ''.join([d for d in t if d in string.digits]) )
-        _t = ''.join([d for d in t if d not in string.digits])
+        count = int(''.join(d for d in t if d in string.digits))
+        _t = ''.join(d for d in t if d not in string.digits)
     return STRUCT_SIZEOF_TYPES[_t] * count
 
-@lru_cache(maxsize=2048, copy=True)
-def set_format(format):
 
+@lru_cache_with_copy(maxsize=2048)
+def set_format(format_list: List[str]) -> Dict[str, Any]:
+    """Set format for struct parsing with caching."""
     __format__ = '<'
     __unpacked_data_elms__ = []
-    __field_offsets__ = dict()
+    __field_offsets__ = {}
     __keys__ = []
     __format_length__ = 0
 
     offset = 0
-    for elm in format:
+    for elm in format_list:
         if ',' in elm:
             elm_type, elm_name = elm.split(',', 1)
             __format__ += elm_type
@@ -872,7 +943,7 @@ def set_format(format):
                 if elm_name in __keys__:
                     search_list = [x[:len(elm_name)] for x in __keys__]
                     occ_count = search_list.count(elm_name)
-                    elm_name =  '{0}_{1:d}'.format(elm_name, occ_count)
+                    elm_name = f'{elm_name}_{occ_count:d}'
                 names.append(elm_name)
                 __field_offsets__[elm_name] = offset
 
@@ -885,7 +956,7 @@ def set_format(format):
 
     __format_length__ = struct.calcsize(__format__)
 
-    return ( __format__, __unpacked_data_elms__, __field_offsets__, __keys__, __format_length__)
+    return (__format__, __unpacked_data_elms__, __field_offsets__, __keys__, __format_length__)
 
 
 
@@ -1130,7 +1201,7 @@ class SectionStructure(Structure):
         if name == 'Characteristics':
             section_flags = retrieve_flags(SECTION_CHARACTERISTICS, 'IMAGE_SCN_')
 
-            # Set the section's flags according to the Characteristics member
+            # Set the section flags according to the Characteristics member
             set_flags(self, val, section_flags)
 
         elif 'IMAGE_SCN_' in name and hasattr(self, name):
@@ -1183,7 +1254,7 @@ class SectionStructure(Structure):
 
 
         # Check whether there's any section after the current one that starts before the
-        # calculated end for the current one. If so, cut the current section's size
+        # calculated end for the current one. If so, cut the current section size
         # to fit in the range up to where the next section starts.
         if (self.next_section_virtual_address is not None and
             self.next_section_virtual_address > self.VirtualAddress and
@@ -1205,28 +1276,28 @@ class SectionStructure(Structure):
 
 
     def get_hash_sha1(self):
-        """Get the SHA-1 hex-digest of the section's data."""
+        """Get the SHA-1 hex-digest of the section data."""
 
         if sha1 is not None:
             return sha1( self.get_data() ).hexdigest()
 
 
     def get_hash_sha256(self):
-        """Get the SHA-256 hex-digest of the section's data."""
+        """Get the SHA-256 hex-digest of the section data."""
 
         if sha256 is not None:
             return sha256( self.get_data() ).hexdigest()
 
 
     def get_hash_sha512(self):
-        """Get the SHA-512 hex-digest of the section's data."""
+        """Get the SHA-512 hex-digest of the section data."""
 
         if sha512 is not None:
             return sha512( self.get_data() ).hexdigest()
 
 
     def get_hash_md5(self):
-        """Get the MD5 hex-digest of the section's data."""
+        """Get the MD5 hex-digest of the section data."""
 
         if md5 is not None:
             return md5( self.get_data() ).hexdigest()
@@ -1279,8 +1350,8 @@ class ImportData(DataContainer):
 
     def __setattr__(self, name, val):
 
-        # If the instance doesn't yet have an ordinal attribute
-        # it's not fully initialized so can't do any of the
+        # If the instance does not yet have an ordinal attribute
+        # it's not fully initialized so cannot do any of the
         # following
         #
         if hasattr(self, 'ordinal') and hasattr(self, 'bound') and hasattr(self, 'name'):
@@ -1345,8 +1416,8 @@ class ExportData(DataContainer):
 
     def __setattr__(self, name, val):
 
-        # If the instance doesn't yet have an ordinal attribute
-        # it's not fully initialized so can't do any of the
+        # If the instance does not yet have an ordinal attribute
+        # it's not fully initialized so cannot do any of the
         # following
         #
         if hasattr(self, 'ordinal') and hasattr(self, 'address') and hasattr(self, 'forwarder') and hasattr(self, 'name'):
@@ -1430,8 +1501,8 @@ class RelocationData(DataContainer):
     """
     def __setattr__(self, name, val):
 
-        # If the instance doesn't yet have a struct attribute
-        # it's not fully initialized so can't do any of the
+        # If the instance does not yet have a struct attribute
+        # it's not fully initialized so cannot do any of the
         # following
         #
         if hasattr(self, 'struct'):
@@ -1501,14 +1572,9 @@ class BoundImportRefData(DataContainer):
 # The filename length is not checked because the DLLs filename
 # can be longer that the 8.3
 
-if PY3:
-    allowed_filename = b(
-        string.ascii_lowercase + string.ascii_uppercase +
-        string.digits + "!#$%&'()-@^_`{}~+,.;=[]")
-else: # Python 2.x
-    allowed_filename = b(
-        string.lowercase + string.uppercase + string.digits +
-        b"!#$%&'()-@^_`{}~+,.;=[]")
+allowed_filename = b(
+    string.ascii_lowercase + string.ascii_uppercase +
+    string.digits + "!#$%&'()-@^_`{}~+,.;=[]")
 
 def is_valid_dos_filename(s):
     if s is None or not isinstance(s, (str, bytes, bytearray)):
@@ -1521,83 +1587,87 @@ def is_valid_dos_filename(s):
 # Check if an imported name uses the valid accepted characters expected in mangled
 # function names. If the symbol's characters don't fall within this charset
 # we will assume the name is invalid
-#
-if PY3:
-    allowed_function_name = b(
-        string.ascii_lowercase + string.ascii_uppercase +
-        string.digits + '_?@$()<>')
-else:
-    allowed_function_name = b(
-        string.lowercase + string.uppercase +
-        string.digits + b'_?@$()<>')
+
+allowed_function_name = (
+    string.ascii_lowercase + string.ascii_uppercase +
+    string.digits + '_?@$()<>'
+).encode('ascii')
+
 
 @lru_cache(maxsize=2048)
-def is_valid_function_name(s):
+def is_valid_function_name(s: Optional[Union[str, bytes, bytearray]]) -> bool:
+    """Check if a function name contains only valid characters."""
     return (s is not None and
-        isinstance(s, (str, bytes, bytearray)) and
-        all(c in allowed_function_name for c in set(s)))
+            isinstance(s, (str, bytes, bytearray)) and
+            all(c in allowed_function_name for c in set(s)))
 
 
-class PE(object):
+class PE:
     """A Portable Executable representation.
 
     This class provides access to most of the information in a PE file.
+    It supports both synchronous and asynchronous operations, pathlib paths,
+    and modern Python features like context managers.
 
-    It expects to be supplied the name of the file to load or PE data
-    to process and an optional argument 'fast_load' (False by default)
-    which controls whether to load all the directories information,
-    which can be quite time consuming.
+    Args:
+        name: Path to the PE file (accepts str or pathlib.Path)
+        data: Raw PE data as bytes
+        fast_load: Skip detailed parsing for faster loading
+        max_symbol_exports: Maximum number of exported symbols to parse
+        max_repeated_symbol: Maximum repeated symbol threshold
 
-    pe = pefile.PE('module.dll')
-    pe = pefile.PE(name='module.dll')
+    Raises:
+        ValueError: If neither name nor data is provided
+        PEFormatError: If the file is not a valid PE format
+        PESecurityError: If security validation fails
+        FileNotFoundError: If the specified file does not exist
 
-    would load 'module.dll' and process it. If the data is already
-    available in a buffer the same can be achieved with:
+    Example:
+        >>> # Traditional usage
+        >>> pe = pefile.PE('program.exe')
+        >>> print(pe.dump_info())
+        
+        >>> # Modern context manager usage
+        >>> with pefile.PE(Path('program.exe')) as pe:
+        ...     print(f"Sections: {len(pe.sections)}")
+        
+        >>> # Async usage
+        >>> pe = await pefile.PE.from_file_async('large_file.exe')
 
-    pe = pefile.PE(data=module_dll_data)
+    Attributes:
+        DOS_HEADER: MS-DOS header structure
+        NT_HEADERS: NT headers structure  
+        FILE_HEADER: COFF file header
+        OPTIONAL_HEADER: Optional header structure
+        sections: List of section structures
+    """
 
-    The "fast_load" can be set to a default by setting its value in the
-    module itself by means, for instance, of a "pefile.fast_load = True".
-    That will make all the subsequent instances not to load the
-    whole PE structure. The "full_load" method can be used to parse
-    the missing data at a later stage.
-
-    Basic headers information will be available in the attributes:
-
-    DOS_HEADER
-    NT_HEADERS
-    FILE_HEADER
-    OPTIONAL_HEADER
-
-    All of them will contain among their attributes the members of the
-    corresponding structures as defined in WINNT.H
-
-    The raw data corresponding to the header (from the beginning of the
-    file up to the start of the first section) will be available in the
-    instance's attribute 'header' as a string.
-
-    The sections will be available as a list in the 'sections' attribute.
-    Each entry will contain as attributes all the structure's members.
-
-    Directory entries will be available as attributes (if they exist):
-    (no other entries are processed at this point)
-
-    DIRECTORY_ENTRY_IMPORT (list of ImportDescData instances)
-    DIRECTORY_ENTRY_EXPORT (ExportDirData instance)
-    DIRECTORY_ENTRY_RESOURCE (ResourceDirData instance)
-    DIRECTORY_ENTRY_DEBUG (list of DebugData instances)
-    DIRECTORY_ENTRY_BASERELOC (list of BaseRelocationData instances)
-    DIRECTORY_ENTRY_TLS
-    DIRECTORY_ENTRY_BOUND_IMPORT (list of BoundImportData instances)
-
-    The following dictionary attributes provide ways of mapping different
-    constants. They will accept the numeric value and return the string
-    representation and the opposite, feed in the string and get the
-    numeric constant:
-
-    DIRECTORY_ENTRY
-    IMAGE_CHARACTERISTICS
-    SECTION_CHARACTERISTICS
+    # The raw data corresponding to the header (from the beginning of the
+    # file up to the start of the first section) will be available in the
+    # instance attribute 'header' as a string.
+    #
+    # The sections will be available as a list in the 'sections' attribute.
+    # Each entry will contain as attributes all the structure members.
+    #
+    # Directory entries will be available as attributes (if they exist):
+    # (no other entries are processed at this point)
+    #
+    # DIRECTORY_ENTRY_IMPORT (list of ImportDescData instances)
+    # DIRECTORY_ENTRY_EXPORT (ExportDirData instance)
+    # DIRECTORY_ENTRY_RESOURCE (ResourceDirData instance)
+    # DIRECTORY_ENTRY_DEBUG (list of DebugData instances)
+    # DIRECTORY_ENTRY_BASERELOC (list of BaseRelocationData instances)
+    # DIRECTORY_ENTRY_TLS
+    # DIRECTORY_ENTRY_BOUND_IMPORT (list of BoundImportData instances)
+    #
+    # The following dictionary attributes provide ways of mapping different
+    # constants. They will accept the numeric value and return the string
+    # representation and the opposite, feed in the string and get the
+    # numeric constant:
+    #
+    # DIRECTORY_ENTRY
+    # IMAGE_CHARACTERISTICS
+    # SECTION_CHARACTERISTICS
     DEBUG_TYPE
     SUBSYSTEM_TYPE
     MACHINE_TYPE
@@ -1802,9 +1872,14 @@ class PE(object):
     __IMAGE_BOUND_FORWARDER_REF_format__ = ('IMAGE_BOUND_FORWARDER_REF',
         ('I,TimeDateStamp', 'H,OffsetModuleName', 'H,Reserved') )
 
-    def __init__(self, name=None, data=None, fast_load=None,
-                 max_symbol_exports=MAX_SYMBOL_EXPORT_COUNT,
-                 max_repeated_symbol=120):
+    def __init__(
+        self, 
+        name: Optional[Union[str, Path]] = None, 
+        data: Optional[bytes] = None, 
+        fast_load: Optional[bool] = None,
+        max_symbol_exports: int = MAX_SYMBOL_EXPORT_COUNT,
+        max_repeated_symbol: int = 120
+    ) -> None:
 
         self.max_symbol_exports = max_symbol_exports
         self.max_repeated_symbol = max_repeated_symbol
@@ -1817,6 +1892,10 @@ class PE(object):
 
         if name is None and data is None:
             raise ValueError('Must supply either name or data')
+
+        # Convert pathlib Path to string for backward compatibility
+        if isinstance(name, Path):
+            name = str(name)
 
         # This list will keep track of all the structures created.
         # That will allow for an easy iteration through the list
@@ -1844,12 +1923,42 @@ class PE(object):
             raise
 
 
-    def close(self):
-        if ( self.__from_file is True and hasattr(self, '__data__') and
+    def close(self) -> None:
+        """Close the PE file and cleanup resources."""
+        if (self.__from_file is True and hasattr(self, '__data__') and
             ((isinstance(mmap.mmap, type) and isinstance(self.__data__, mmap.mmap)) or
-           'mmap.mmap' in repr(type(self.__data__))) ):
+             'mmap.mmap' in repr(type(self.__data__)))):
                 self.__data__.close()
                 del self.__data__
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.close()
+        return False
+
+    @classmethod
+    async def from_file_async(cls, filepath: Union[str, Path], fast_load: bool = False) -> "PE":
+        """Asynchronously create PE instance from file.
+        
+        Requires aiofiles package for async file operations.
+        """
+        if not ASYNC_SUPPORT:
+            raise ImportError("Async support requires 'aiofiles' package")
+        
+        filepath = Path(filepath)
+        
+        # Security check
+        if filepath.stat().st_size > DEFAULT_CONFIG.max_file_size:
+            raise PESecurityError(f"File too large: {filepath.stat().st_size}")
+        
+        async with aiofiles.open(filepath, 'rb') as f:
+            data = await f.read()
+        
+        return cls(data=data, fast_load=fast_load)
 
 
     def __unpack_data__(self, format, data, file_offset):
@@ -1864,8 +1973,7 @@ class PE(object):
             structure.__unpack__(data)
         except PEFormatError as err:
             self.__warnings.append(
-                'Corrupt header "{0}" at file offset {1}. Exception: {2}'.format(
-                    format[0], file_offset, err) )
+                f'Corrupt header "{format[0]}" at file offset {file_offset}. Exception: {err}')
             return None
 
         self.__structures__.append(structure)
@@ -1873,17 +1981,26 @@ class PE(object):
         return structure
 
 
-    def __parse__(self, fname, data, fast_load):
+    def __parse__(self, fname: Optional[str], data: Optional[bytes], fast_load: bool) -> None:
         """Parse a Portable Executable file.
 
         Loads a PE file, parsing all its structures and making them available
-        through the instance's attributes.
+        through the instance attributes.
         """
 
         if fname is not None:
+            # Security: Validate file path
+            if not isinstance(fname, str) or len(fname) > 4096:
+                raise PESecurityError("Invalid file path")
+            
             stat = os.stat(fname)
             if stat.st_size == 0:
                 raise PEFormatError('The file is empty')
+            
+            # Security: Check file size limit
+            if stat.st_size > DEFAULT_CONFIG.max_file_size:
+                raise PESecurityError(f"File too large: {stat.st_size} bytes (max: {DEFAULT_CONFIG.max_file_size})")
+            
             fd = None
             try:
                 fd = open(fname, 'rb')
@@ -1896,13 +2013,20 @@ class PE(object):
                     self.__data__ = mmap.mmap(self.fileno, 0, access=mmap.ACCESS_READ)
                 self.__from_file = True
             except IOError as excp:
-                exception_msg = '{0}'.format(excp)
-                exception_msg = exception_msg and (': %s' % exception_msg)
-                raise Exception('Unable to access file \'{0}\'{1}'.format(fname, exception_msg))
+                exception_msg = f'{excp}'
+                exception_msg = exception_msg and (f': {exception_msg}')
+                raise Exception(f'Unable to access file \'{fname}\'{exception_msg}')
             finally:
                 if fd is not None:
                     fd.close()
         elif data is not None:
+            # Security: Validate data input
+            if not isinstance(data, (bytes, bytearray)):
+                raise PESecurityError("Data must be bytes or bytearray")
+            
+            if len(data) > DEFAULT_CONFIG.max_file_size:
+                raise PESecurityError(f"Data too large: {len(data)} bytes (max: {DEFAULT_CONFIG.max_file_size})")
+            
             self.__data__ = data
             self.__from_file = False
 
@@ -1914,13 +2038,13 @@ class PE(object):
         if not fast_load:
             for byte, byte_count in Counter(bytearray(self.__data__)).items():
                 # Only report the cases where a byte makes up for more than 50% (if
-                # zero) or 15% (if non-zero) of the file's contents. There are
+                # zero) or 15% (if non-zero) of the file contents. There are
                 # legitimate PEs where 0x00 bytes are close to 50% of the whole
-                # file's contents.
+                # file contents.
                 if (byte == 0 and 1.0 * byte_count / len(self.__data__) > 0.5) or (
                     byte != 0 and 1.0 * byte_count / len(self.__data__) > 0.15):
                     self.__warnings.append(
-                        ("Byte 0x{0:02x} makes up {1:.4f}% of the file's contents."
+                        ("Byte 0x{0:02x} makes up {1:.4f}% of the file contents."
                         " This may indicate truncation / malformation.").format(
                             byte, 100.0 * byte_count / len(self.__data__)))
 
@@ -2159,7 +2283,7 @@ class PE(object):
         # greater than 0
         # fc91013eb72529da005110a3403541b6 example
         # Should this throw an exception in the minimum header offset
-        # can't be found?
+        # cannot be found?
         #
         rawDataPointers = [
             self.adjust_FileAlignment( s.PointerToRawData,
@@ -2228,7 +2352,7 @@ class PE(object):
             # string.
             rich_data = self.get_data(0x80, rich_index + 8)
             # Make the data have length a multiple of 4, otherwise the
-            # subsequent parsing will fail. It's not impossible that we retrieve
+            # subsequent parsing will fail. It is not impossible that we retrieve
             # truncated data that it's not a multiple.
             rich_data = rich_data[:4*int(len(rich_data)/4)]
             data = list(struct.unpack(
@@ -2383,11 +2507,11 @@ class PE(object):
 
         The sections will be readily available in the "sections" attribute.
         Its attributes will contain all the section information plus "data"
-        a buffer containing the section's data.
+        a buffer containing the section data.
 
         The "Characteristics" member will be processed and attributes
         representing the section characteristics (with the 'IMAGE_SCN_'
-        string trimmed from the constant's names) will be added to the
+        string trimmed from the constant names) will be added to the
         section instance.
 
         Refer to the SectionStructure class for additional info.
@@ -2457,7 +2581,7 @@ class PE(object):
 
             section_flags = retrieve_flags(SECTION_CHARACTERISTICS, 'IMAGE_SCN_')
 
-            # Set the section's flags according the the Characteristics member
+            # Set the section flags according the the Characteristics member
             set_flags(section, section.Characteristics, section_flags)
 
             if ( section.__dict__.get('IMAGE_SCN_MEM_WRITE', False)  and
@@ -2496,7 +2620,7 @@ class PE(object):
     def parse_data_directories(self, directories=None,
                                forwarded_exports_only=False,
                                import_dllnames_only=False):
-        """Parse and process the PE file's data directories.
+        """Parse and process the PE file data directories.
 
         If the optional argument 'directories' is given, only
         the directories at the specified indexes will be parsed.
@@ -2583,7 +2707,7 @@ class PE(object):
                    self.__data__[rva:rva+bnd_descr_size],
                    file_offset = rva)
             if bnd_descr is None:
-                # If can't parse directory then silently return.
+                # If cannot parse directory then silently return.
                 # This directory does not necessarily have to be valid to
                 # still have a valid PE file
 
@@ -2772,7 +2896,7 @@ class PE(object):
                 break
 
             # rlc.SizeOfBlock must be less or equal than the size of the image
-            # (It's a rather loose sanity test)
+            # (It is a rather loose sanity test)
             if rlc.SizeOfBlock > self.OPTIONAL_HEADER.SizeOfImage:
                 self.__warnings.append(
                     'Invalid relocation information. SizeOfBlock too large'
@@ -2983,11 +3107,11 @@ class PE(object):
         IMAGE_RESOURCE_DIRECTORY plus 'entries', a list of all the
         entries in the directory.
 
-        Those entries will have, correspondingly, all the structure's
+        Those entries will have, correspondingly, all the structure
         members (IMAGE_RESOURCE_DIRECTORY_ENTRY) and an additional one,
         "directory", pointing to the IMAGE_RESOURCE_DIRECTORY structure
         representing upper layers of the tree. This one will also have
-        an 'entries' attribute, pointing to the 3rd, and last, level.
+        an 'entries' attribute, pointing to the third, and last, level.
         Another directory with more entries. Those last entries will
         have a new attribute (both 'leaf' or 'data_entry' can be used to
         access it). This structure finally points to the resource data.
@@ -3028,7 +3152,7 @@ class PE(object):
             self.__IMAGE_RESOURCE_DIRECTORY_format__, data,
             file_offset = self.get_offset_from_rva(rva) )
         if resource_dir is None:
-            # If we can't parse resources directory then silently return.
+            # If we cannot parse resources directory then silently return.
             # This directory does not necessarily have to be valid to
             # still have a valid PE file
             self.__warnings.append(
@@ -3100,7 +3224,7 @@ class PE(object):
                 try:
                     entry_name = UnicodeStringWrapperPostProcessor(self, ustr_offset)
                     self.__total_resource_bytes += entry_name.get_pascal_16_length()
-                    # If the last entry's offset points before the current's but its end
+                    # If the last entry offset points before the current's but its end
                     # is past the current's beginning, assume the overlap indicates a
                     # corrupt name.
                     if last_name_begin_end and (last_name_begin_end[0] < ustr_offset and
@@ -3363,7 +3487,7 @@ class PE(object):
         # These should return 'ascii' decoded data. For the case when it's
         # garbled data the ascii string will retain the byte values while
         # encoding it to something else may yield values that don't match the
-        # file's contents.
+        # file contents.
         try:
             if section_end is None:
                 versioninfo_string = self.get_string_u_at_rva(
@@ -4378,9 +4502,9 @@ class PE(object):
         which sections are processed.
         Any section with their VirtualAddress beyond this value will be skipped.
         Normally, sections with values beyond this range are just there to confuse
-        tools. It's a common trick to see in packed executables.
+        tools. It is a common trick to see in packed executables.
 
-        If the 'ImageBase' optional argument is supplied, the file's relocations
+        If the 'ImageBase' optional argument is supplied, the file relocations
         will be applied to the image by calling the 'relocate_image()' method. Beware
         that the relocation information is applied permanently.
         """
@@ -4515,7 +4639,7 @@ class PE(object):
                 return None
             else:
                 return offset
-            #raise PEFormatError("specified offset (0x%x) doesn't belong to any section." % offset)
+            #raise PEFormatError("specified offset (0x%x) does not belong to any section." % offset)
         return s.get_rva_from_offset(offset)
 
     def get_offset_from_rva(self, rva):
@@ -5259,7 +5383,7 @@ class PE(object):
         'offset' is assumed to index into a dword array. So setting it to
         N will return a dword out of the data starting at offset N*4.
 
-        Returns None if the data can't be turned into a double word.
+        Returns None if the data cannot be turned into a double word.
         """
 
         if (offset+1)*4 > len(data):
@@ -5271,7 +5395,7 @@ class PE(object):
     def get_dword_at_rva(self, rva):
         """Return the double word value at the given RVA.
 
-        Returns None if the value can't be read, i.e. the RVA can't be mapped
+        Returns None if the value cannot be read, i.e. the RVA cannot be mapped
         to a file offset.
         """
 
@@ -5316,7 +5440,7 @@ class PE(object):
         'offset' is assumed to index into a word array. So setting it to
         N will return a dword out of the data starting at offset N*2.
 
-        Returns None if the data can't be turned into a word.
+        Returns None if the data cannot be turned into a word.
         """
 
         if (offset+1)*2 > len(data):
@@ -5328,7 +5452,7 @@ class PE(object):
     def get_word_at_rva(self, rva):
         """Return the word value at the given RVA.
 
-        Returns None if the value can't be read, i.e. the RVA can't be mapped
+        Returns None if the value cannot be read, i.e. the RVA cannot be mapped
         to a file offset.
         """
 
@@ -5372,7 +5496,7 @@ class PE(object):
         'offset' is assumed to index into a word array. So setting it to
         N will return a dword out of the data starting at offset N*8.
 
-        Returns None if the data can't be turned into a quad word.
+        Returns None if the data cannot be turned into a quad word.
         """
 
         if (offset+1)*8 > len(data):
@@ -5384,7 +5508,7 @@ class PE(object):
     def get_qword_at_rva(self, rva):
         """Return the quad-word value at the given RVA.
 
-        Returns None if the value can't be read, i.e. the RVA can't be mapped
+        Returns None if the value cannot be read, i.e. the RVA cannot be mapped
         to a file offset.
         """
 
@@ -5423,7 +5547,7 @@ class PE(object):
         """Overwrite, with the given string, the bytes at the file offset corresponding to the given RVA.
 
         Return True if successful, False otherwise. It can fail if the
-        offset is outside the file's boundaries.
+        offset is outside the file boundaries.
         """
 
         if not isinstance(data, bytes):
@@ -5440,7 +5564,7 @@ class PE(object):
         """Overwrite the bytes at the given file offset with the given string.
 
         Return True if successful, False otherwise. It can fail if the
-        offset is outside the file's boundaries.
+        offset is outside the file boundaries.
         """
 
         if not isinstance(data, bytes):
@@ -5469,7 +5593,7 @@ class PE(object):
         """Apply the relocation information to the image using the provided new image base.
 
         This method will apply the relocation information to the image. Given the new base,
-        all the relocations will be processed and both the raw data and the section's data
+        all the relocations will be processed and both the raw data and the section data
         will be fixed accordingly.
         The resulting image can be retrieved as well through the method:
 
@@ -5695,7 +5819,7 @@ class PE(object):
             self.parse_data_directories(directories=[
                 DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_IMPORT']])
 
-        # If there's still no import directory (the PE doesn't have one or it's
+        # If there's still no import directory (the PE does not have one or it's
         # malformed), give up.
         if not hasattr(self, 'DIRECTORY_ENTRY_IMPORT'):
             return False
@@ -5824,23 +5948,48 @@ class PE(object):
 
 
 
-def main():
+def main() -> None:
+    """Command-line interface for pefile."""
+    import argparse
     import sys
+    from pathlib import Path
 
-    usage = """\
-pefile.py <filename>
-pefile.py exports <filename>"""
+    parser = argparse.ArgumentParser(
+        description="Parse and analyze Portable Executable (PE) files",
+        prog="pefile"
+    )
+    parser.add_argument("filename", type=Path, help="PE file to analyze")
+    parser.add_argument(
+        "--exports", action="store_true", 
+        help="Show exports table"
+    )
+    parser.add_argument(
+        "--version", action="version", 
+        version=f"pefile {__version__}"
+    )
 
-    if not sys.argv[1:]:
-        print(usage)
-    elif sys.argv[1] == 'exports':
-        if not sys.argv[2:]:
-            sys.exit('error: <filename> required')
-        pe = PE(sys.argv[2])
-        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-            print(hex(pe.OPTIONAL_HEADER.ImageBase + exp.address), exp.name, exp.ordinal)
-    else:
-        print(PE(sys.argv[1]).dump_info())
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
+
+    args = parser.parse_args()
+
+    try:
+        pe = PE(args.filename)
+        
+        if args.exports:
+            if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
+                for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+                    print(f"{hex(pe.OPTIONAL_HEADER.ImageBase + exp.address)} {exp.name} {exp.ordinal}")
+            else:
+                print("No exports found in this PE file")
+        else:
+            print(pe.dump_info())
+            
+    except Exception as e:
+        print(f"Error processing {args.filename}: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 if __name__ == '__main__':
     main()
