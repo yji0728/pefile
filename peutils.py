@@ -497,63 +497,192 @@ class SignatureDatabase:
 
 
 
-def is_valid( pe ):
-    """"""
-    pass
-
-
-def is_suspicious( pe ):
+def is_valid(pe):
+    """Check if a PE file has valid structure and headers.
+    
+    Args:
+        pe: A pefile.PE instance
+        
+    Returns:
+        bool: True if the PE appears to be valid, False otherwise
+        
+    This function performs basic structural validation including:
+    - Valid DOS header signature
+    - Valid PE signature  
+    - Valid machine type
+    - Valid section alignment
+    - Consistent header information
     """
-    unusual locations of import tables
-    non recognized section names
-    presence of long ASCII strings
-    """
+    
+    # Check if PE has required attributes
+    if not hasattr(pe, 'DOS_HEADER') or not hasattr(pe, 'NT_HEADERS'):
+        return False
+        
+    # Check DOS header signature (MZ)
+    if pe.DOS_HEADER.e_magic != 0x5A4D:  # 'MZ'
+        return False
+        
+    # Check PE signature
+    if not hasattr(pe, 'NT_HEADERS') or not hasattr(pe.NT_HEADERS, 'Signature'):
+        return False
+    if pe.NT_HEADERS.Signature != 0x4550:  # 'PE\0\0'
+        return False
+        
+    # Check if file has sections
+    if not hasattr(pe, 'sections') or not pe.sections:
+        return False
+        
+    # Check if machine type is recognized
+    if not hasattr(pe.FILE_HEADER, 'Machine'):
+        return False
+    # Common machine types: IMAGE_FILE_MACHINE_I386 (0x14c), IMAGE_FILE_MACHINE_AMD64 (0x8664), etc.
+    valid_machines = [0x14c, 0x8664, 0x1c0, 0x1c4, 0xaa64, 0x1f0, 0x1f1]
+    if pe.FILE_HEADER.Machine not in valid_machines:
+        return False
+        
+    # Check section alignment - should be power of 2 and at least 512
+    if hasattr(pe, 'OPTIONAL_HEADER'):
+        if hasattr(pe.OPTIONAL_HEADER, 'SectionAlignment'):
+            section_alignment = pe.OPTIONAL_HEADER.SectionAlignment
+            if section_alignment < 512 or (section_alignment & (section_alignment - 1)) != 0:
+                # Not a power of 2 or less than 512
+                return False
+                
+        # Check file alignment - should be power of 2 between 512 and 64K
+        if hasattr(pe.OPTIONAL_HEADER, 'FileAlignment'):
+            file_alignment = pe.OPTIONAL_HEADER.FileAlignment
+            if file_alignment < 512 or file_alignment > 65536:
+                return False
+            if (file_alignment & (file_alignment - 1)) != 0:
+                # Not a power of 2
+                return False
+                
+    # Check that sections don't have obviously wrong values
+    for section in pe.sections:
+        # Virtual size shouldn't be 0
+        if section.Misc_VirtualSize == 0:
+            continue
+            
+        # Check if section RVA is valid
+        if section.VirtualAddress < 0:
+            return False
+            
+        # Check if section size is reasonable (not larger than file)
+        if section.SizeOfRawData > len(pe.__data__):
+            return False
+            
+    return True
 
+
+def is_suspicious(pe):
+    """Check if a PE file has suspicious characteristics that may indicate malware or obfuscation.
+    
+    Args:
+        pe: A pefile.PE instance
+        
+    Returns:
+        bool: True if suspicious characteristics are found, False otherwise
+        
+    This function checks for various suspicious indicators including:
+    - Relocations overlapping entry point
+    - Import tables in unusual locations
+    - Parsing warnings
+    - Unusual section names or characteristics
+    - High entropy sections combined with certain file types
+    """
+    
+    suspicious_indicators = []
+    
+    # Check for relocations overlapping entry point
     relocations_overlap_entry_point = False
     sequential_relocs = 0
 
     # If relocation data is found and the entries go over the entry point, and also are very
     # continuous or point outside section's boundaries => it might imply that an obfuscation
     # trick is being used or the relocations are corrupt (maybe intentionally)
-    #
     if hasattr(pe, 'DIRECTORY_ENTRY_BASERELOC'):
         for base_reloc in pe.DIRECTORY_ENTRY_BASERELOC:
             last_reloc_rva = None
             for reloc in base_reloc.entries:
                 if reloc.rva <= pe.OPTIONAL_HEADER.AddressOfEntryPoint <= reloc.rva + 4:
                     relocations_overlap_entry_point = True
+                    suspicious_indicators.append("Relocations overlap entry point")
 
                 if last_reloc_rva is not None and last_reloc_rva <= reloc.rva <= last_reloc_rva + 4:
                     sequential_relocs += 1
 
                 last_reloc_rva = reloc.rva
+                
+    # Many sequential relocations can be suspicious
+    if sequential_relocs > 100:
+        suspicious_indicators.append(f"High number of sequential relocations: {sequential_relocs}")
 
+    # Check if import tables or strings exist within the header or between PE header and first section
+    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT') and pe.sections:
+        first_section_start = min(section.PointerToRawData for section in pe.sections if section.PointerToRawData > 0)
+        
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            # Check if import descriptor is in an unusual location
+            try:
+                import_rva = entry.struct.OriginalFirstThunk or entry.struct.FirstThunk
+                import_offset = pe.get_offset_from_rva(import_rva)
+                if import_offset < first_section_start:
+                    suspicious_indicators.append("Import table in header area")
+            except:
+                pass
 
-
-    # If import tables or strings exist (are pointed to) to within the header or in the area
-    # between the PE header and the first section that's supicious
-    #
-    # IMPLEMENT
-
-
-    warnings_while_parsing = False
-    # If we have warnings, that's suspicious, some of those will be because of out-of-ordinary
-    # values are found in the PE header fields
-    # Things that are reported in warnings:
-    # (parsing problems, special section characteristics i.e. W & X, uncommon values of fields,
-    # unusual entrypoint, suspicious imports)
-    #
+    # Check for parsing warnings
     warnings = pe.get_warnings()
     if warnings:
-        warnings_while_parsing
-
-    # If there are few or none (should come with a standard "density" of strings/kilobytes of data) longer (>8)
-    # ascii sequences that might indicate packed data, (this is similar to the entropy test in some ways but
-    # might help to discard cases of legitimate installer or compressed data)
-
-    # If compressed data (high entropy) and is_driver => uuuuhhh, nasty
-
-    pass
+        suspicious_indicators.append(f"PE parsing warnings: {len(warnings)}")
+        
+    # Check for unusual section names
+    suspicious_section_names = [b'.packed', b'.aspack', b'.adata', b'BitArts', b'.ndata']
+    for section in pe.sections:
+        section_name = section.Name.rstrip(b'\x00')
+        if section_name in suspicious_section_names:
+            suspicious_indicators.append(f"Suspicious section name: {section_name.decode('utf-8', errors='ignore')}")
+            
+        # Check for sections with both write and execute permissions
+        if (section.Characteristics & 0x20000000) and (section.Characteristics & 0x80000000):
+            suspicious_indicators.append(f"Section with W+X: {section_name.decode('utf-8', errors='ignore')}")
+            
+        # Check for sections with very high entropy
+        if hasattr(section, 'get_entropy'):
+            entropy = section.get_entropy()
+            if entropy > 7.5:
+                suspicious_indicators.append(f"High entropy section: {section_name.decode('utf-8', errors='ignore')} ({entropy:.2f})")
+    
+    # Check for compressed data in drivers - very suspicious
+    if hasattr(pe, 'is_driver') and callable(pe.is_driver):
+        if pe.is_driver():
+            if is_probably_packed(pe):
+                suspicious_indicators.append("Driver with packed/compressed data")
+    
+    # Check for unusual entry point
+    if hasattr(pe, 'OPTIONAL_HEADER'):
+        entry_point_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        entry_point_in_section = False
+        
+        for section in pe.sections:
+            if section.VirtualAddress <= entry_point_rva < section.VirtualAddress + section.Misc_VirtualSize:
+                entry_point_in_section = True
+                # Entry point in last section is suspicious
+                if section == pe.sections[-1]:
+                    suspicious_indicators.append("Entry point in last section")
+                break
+                
+        if not entry_point_in_section:
+            suspicious_indicators.append("Entry point not in any section")
+    
+    # Check for very few imports (could indicate dynamic import resolution)
+    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+        total_imports = sum(len(entry.imports) for entry in pe.DIRECTORY_ENTRY_IMPORT)
+        if total_imports < 5:
+            suspicious_indicators.append(f"Very few imports: {total_imports}")
+    
+    # Return True if any suspicious indicators were found
+    return len(suspicious_indicators) > 0
 
 
 def is_probably_packed( pe ):
