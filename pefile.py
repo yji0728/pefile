@@ -1668,14 +1668,13 @@ class PE:
     # DIRECTORY_ENTRY
     # IMAGE_CHARACTERISTICS
     # SECTION_CHARACTERISTICS
-    DEBUG_TYPE
-    SUBSYSTEM_TYPE
-    MACHINE_TYPE
-    RELOCATION_TYPE
-    RESOURCE_TYPE
-    LANG
-    SUBLANG
-    """
+    # DEBUG_TYPE
+    # SUBSYSTEM_TYPE
+    # MACHINE_TYPE
+    # RELOCATION_TYPE
+    # RESOURCE_TYPE
+    # LANG
+    # SUBLANG
 
     #
     # Format specifications for PE structures.
